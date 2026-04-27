@@ -58,6 +58,8 @@ BOAT_PY: dict[str, float] = {
     # "MijnBoot": 1050,
 }
 
+DEMO_NAAM: str = "Voorjaarswedstrijd 2026"
+
 # ==============================================================================
 # DEMO-DATA - voorjaarswedstrijd 2026 (6 deelnemers, 5 reeksen)
 # Tijden overgenomen uit het wedstrijdblad.
@@ -217,8 +219,8 @@ def rank_each_race(df: pd.DataFrame) -> pd.DataFrame:
 def calculate_points(df: pd.DataFrame) -> pd.DataFrame:
     """
     Wijs punten toe: rang = punten (1e = 1 punt, laagste totaal wint).
-    Niet-gestarte (DNS) of niet-gefinisht (DNF) deelnemers krijgen aantal_deelnemers + 1 punten
-    maar die logica is hier niet nodig tenzij DNS/DNF-rijen aanwezig zijn.
+    DNS/DNF-deelnemers (ontbrekende rijen) krijgen in generate_summary_tables
+    automatisch starters_in_reeks + 1 strafpunten toegewezen.
     """
     df = df.copy()
     df["punten"] = df["rang"]
@@ -245,15 +247,20 @@ def drop_worst_result(df: pd.DataFrame) -> pd.DataFrame:
 def generate_summary_tables(df: pd.DataFrame, use_drop: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Genereer twee tabellen:
-    1. detail_tabel: per deelnemer per reeks alle tijden, gecorrigeerde tijd en rang
-    2. samenvatting: totaalklassement met optionele schrap
+    1. detail_tabel: per deelnemer per reeks alle tijden, gecorrigeerde tijd en rang.
+       Bevat kolom 'Geschrapt' als drop_worst_result() al is toegepast.
+    2. samenvatting: totaalklassement met optionele schrap.
+       Ontbrekende reeksen (DNS) krijgen strafpunten: starters_in_reeks + 1.
 
     Geeft (detail_tabel, samenvatting) terug.
     """
     # --- Detailtabel ---
-    detail = df[["naam", "boottype", "py", "reeks", "minuten", "seconden",
-                 "totaal_seconden", "gecorrigeerde_tijd", "rang", "punten"]].copy()
-    detail = detail.rename(columns={
+    base_cols = ["naam", "boottype", "py", "reeks", "minuten", "seconden",
+                 "totaal_seconden", "gecorrigeerde_tijd", "rang", "punten"]
+    if "geschrapt" in df.columns:
+        base_cols.append("geschrapt")
+    detail = df[base_cols].copy()
+    rename_map = {
         "naam": "Naam",
         "boottype": "Boottype",
         "py": "PY",
@@ -264,32 +271,40 @@ def generate_summary_tables(df: pd.DataFrame, use_drop: bool = False) -> tuple[p
         "gecorrigeerde_tijd": "Gecorr. tijd",
         "rang": "Rang",
         "punten": "Punten",
-    })
+    }
+    if "geschrapt" in df.columns:
+        rename_map["geschrapt"] = "Geschrapt"
+    detail = detail.rename(columns=rename_map)
     detail = detail.sort_values(["Reeks", "Rang"])
 
     # --- Samenvatting per deelnemer ---
     reeksen = sorted(df["reeks"].unique())
+    # DNS penalty: starters in that race + 1
+    starters_per_reeks = df.groupby("reeks").size().to_dict()
     rijen = []
 
-    for naam, groep in df.groupby("naam"):
+    for naam in sorted(df["naam"].unique()):
+        groep = df[df["naam"] == naam]
         rij = {"Naam": naam, "Boottype": groep["boottype"].iloc[0]}
 
         punten_per_reeks = {}
         for reeks in reeksen:
             r = groep[groep["reeks"] == reeks]
             if r.empty:
-                punten_per_reeks[reeks] = None
+                # DNS: strafpunten = aantal starters in die reeks + 1
+                punten_per_reeks[reeks] = starters_per_reeks.get(reeks, 0) + 1
             else:
                 punten_per_reeks[reeks] = int(r["punten"].iloc[0])
 
         for reeks in reeksen:
-            rij[f"R{reeks}"] = punten_per_reeks[reeks] if punten_per_reeks[reeks] is not None else "DNS"
+            is_dns = groep[groep["reeks"] == reeks].empty
+            rij[f"R{reeks}"] = "DNS" if is_dns else punten_per_reeks[reeks]
 
-        geldige = [p for p in punten_per_reeks.values() if p is not None]
-        rij["Som alle"] = sum(geldige)
-        rij["Slechtste"] = max(geldige) if geldige else 0
+        alle = list(punten_per_reeks.values())
+        rij["Som alle"] = sum(alle)
+        rij["Slechtste"] = max(alle) if alle else 0
 
-        if use_drop and len(geldige) > 1:
+        if use_drop and len(alle) > 1:
             rij["Totaal punten"] = rij["Som alle"] - rij["Slechtste"]
         else:
             rij["Totaal punten"] = rij["Som alle"]
@@ -349,7 +364,6 @@ def _auto_width(ws):
 
 def _write_samenvatting_sheet(wb, samenvatting: pd.DataFrame):
     ws = wb.create_sheet("Klassement")
-    ws.title = "Klassement"
 
     ws.append(["TOTAALKLASSEMENT"])
     ws["A1"].font = Font(bold=True, size=14, color="1F4E79")
@@ -382,6 +396,7 @@ def _write_detail_sheet(wb, detail: pd.DataFrame):
     ws["A1"].font = Font(bold=True, size=14, color="1F4E79")
     ws.append([])
 
+    has_geschrapt = "Geschrapt" in detail.columns
     reeksen = sorted(detail["Reeks"].unique())
     for reeks in reeksen:
         ws.append([f"Reeks {reeks}"])
@@ -389,18 +404,20 @@ def _write_detail_sheet(wb, detail: pd.DataFrame):
         ws[f"A{hdr_row}"].font = Font(bold=True, size=12, color="2E75B6")
 
         subset = detail[detail["Reeks"] == reeks].drop(columns=["Reeks"])
-        headers = list(subset.columns)
-        ws.append(headers)
+        display_cols = [c for c in subset.columns if c != "Geschrapt"]
+        ws.append(display_cols)
         _header_stijl(ws, ws.max_row, fill_hex="2E75B6")
 
         for _, row in subset.iterrows():
             vals = []
-            for v in row:
-                if isinstance(v, float):
-                    vals.append(round(v, 2))
-                else:
-                    vals.append(v)
+            for c in display_cols:
+                v = row[c]
+                vals.append(round(v, 2) if isinstance(v, float) else v)
             ws.append(vals)
+            if has_geschrapt and row.get("Geschrapt", False):
+                strike = Font(strikethrough=True, color="808080")
+                for cell in ws[ws.max_row]:
+                    cell.font = strike
 
         ws.append([])  # lege rij tussen reeksen
 
@@ -482,43 +499,44 @@ def druk_klassement(samenvatting: pd.DataFrame):
 def interactief_menu():
     print("\n╔══════════════════════════════════════════╗")
     print("║  WedstrijdCalculator - PY Handicap Scoring ║")
-    print("╚══════════════════════════════════════════╝\n")
-    print("Opties:")
-    print("  1. Verwerk invoerbestand (CSV of Excel)")
-    print("  2. Start met demo-data")
-    print("  3. Toon beschikbare boottypes en PY-waarden")
-    print("  4. Afsluiten")
-    keuze = input("\nKeuze (1-4): ").strip()
+    print("╚══════════════════════════════════════════╝")
 
-    if keuze == "1":
-        pad = input("Pad naar invoerbestand (CSV/XLSX): ").strip()
-        schrap_str = input("Schrapresultaat toepassen? (j/n, standaard j): ").strip().lower()
-        schrap = schrap_str != "n"
-        uitvoer = input("Uitvoerbestand (Enter = wedstrijd_resultaten.xlsx): ").strip()
-        if not uitvoer:
-            uitvoer = "wedstrijd_resultaten.xlsx"
-        detail, samenvatting = bereken_wedstrijd(pad, schrap=schrap, uitvoer_pad=uitvoer)
-        druk_klassement(samenvatting)
+    while True:
+        print("\nOpties:")
+        print("  1. Verwerk invoerbestand (CSV of Excel)")
+        print("  2. Start met demo-data")
+        print("  3. Toon beschikbare boottypes en PY-waarden")
+        print("  4. Afsluiten")
+        keuze = input("\nKeuze (1-4): ").strip()
 
-    elif keuze == "2":
-        schrap_str = input("Schrapresultaat toepassen? (j/n, standaard j): ").strip().lower()
-        schrap = schrap_str != "n"
-        detail, samenvatting = bereken_wedstrijd(None, schrap=schrap)
-        druk_klassement(samenvatting)
+        if keuze == "1":
+            pad = input("Pad naar invoerbestand (CSV/XLSX): ").strip()
+            schrap_str = input("Schrapresultaat toepassen? (j/n, standaard j): ").strip().lower()
+            schrap = schrap_str != "n"
+            uitvoer = input("Uitvoerbestand (Enter = wedstrijd_resultaten.xlsx): ").strip()
+            if not uitvoer:
+                uitvoer = "wedstrijd_resultaten.xlsx"
+            detail, samenvatting = bereken_wedstrijd(pad, schrap=schrap, uitvoer_pad=uitvoer)
+            druk_klassement(samenvatting)
 
-    elif keuze == "3":
-        py_table = load_boat_py_table()
-        print(f"\n{'Boottype':<25} {'PY':>6}")
-        print("-" * 33)
-        for bt, py in sorted(py_table.items(), key=lambda x: x[1]):
-            print(f"{bt:<25} {py:>6.0f}")
-        print()
+        elif keuze == "2":
+            schrap_str = input("Schrapresultaat toepassen? (j/n, standaard j): ").strip().lower()
+            schrap = schrap_str != "n"
+            detail, samenvatting = bereken_wedstrijd(None, schrap=schrap)
+            druk_klassement(samenvatting)
 
-    elif keuze == "4":
-        print("Tot ziens!")
-        sys.exit(0)
-    else:
-        print("Ongeldige keuze.")
+        elif keuze == "3":
+            py_table = load_boat_py_table()
+            print(f"\n{'Boottype':<25} {'PY':>6}")
+            print("-" * 33)
+            for bt, py in sorted(py_table.items(), key=lambda x: x[1]):
+                print(f"{bt:<25} {py:>6.0f}")
+
+        elif keuze == "4":
+            print("Tot ziens!")
+            sys.exit(0)
+        else:
+            print("Ongeldige keuze.")
 
 
 def main():

@@ -32,6 +32,8 @@ from wedstrijd_calculator import (
     drop_worst_result,
     generate_summary_tables,
     export_to_excel,
+    DEMO_NAAM,
+    DEMO_DATA,
 )
 
 ctk.set_appearance_mode("Dark")
@@ -44,11 +46,12 @@ CLR_ACCENT  = "#2E75B6"
 # Always pick combinations with high contrast (WCAG AA minimum 4.5:1).
 ROW_COLORS = {
     # tag        dark_bg      dark_fg      light_bg     light_fg
-    "gold":   ("#7A6000",  "#FFE680",  "#FFF3B0",  "#5A4000"),
-    "silver": ("#4A5568",  "#E2E8F0",  "#E2E8F0",  "#2D3748"),
-    "bronze": ("#7A4010",  "#FFD0A0",  "#FFE8D0",  "#6B3010"),
-    "odd":    ("#323232",  "#E8E8E8",  "#EDF2FB",  "#1A1A2E"),
-    "even":   ("#2B2B2B",  "#E8E8E8",  "#FFFFFF",  "#1A1A2E"),
+    "gold":      ("#7A6000",  "#FFE680",  "#FFF3B0",  "#5A4000"),
+    "silver":    ("#4A5568",  "#E2E8F0",  "#E2E8F0",  "#2D3748"),
+    "bronze":    ("#7A4010",  "#FFD0A0",  "#FFE8D0",  "#6B3010"),
+    "odd":       ("#323232",  "#E8E8E8",  "#EDF2FB",  "#1A1A2E"),
+    "even":      ("#2B2B2B",  "#E8E8E8",  "#FFFFFF",  "#1A1A2E"),
+    "geschrapt": ("#5A1F1F",  "#FF9090",  "#FFE8E8",  "#5A0000"),
 }
 
 
@@ -57,6 +60,8 @@ ROW_COLORS = {
 # ==============================================================================
 
 class DataTable(tk.Frame):
+    _instances: list["DataTable"] = []
+
     def __init__(self, parent, columns: list[str], row_height: int = 30, **kw):
         dark = ctk.get_appearance_mode() == "Dark"
         super().__init__(parent, bg="#2b2b2b" if dark else "#f4f6fa", **kw)
@@ -72,17 +77,20 @@ class DataTable(tk.Frame):
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
         self._dark = dark
+        self._row_height = row_height
         self._setup_tags()
         for col in columns:
             self.tv.heading(col, text=col)
             self.tv.column(col, width=100, anchor="center", minwidth=40)
+        DataTable._instances.append(self)
 
     @staticmethod
     def _apply_style(dark: bool, row_height: int = 30):
         s = ttk.Style()
-        # "clam" is required on Windows: the default vista/winnative theme ignores
-        # tag foreground colors completely, making text unreadable.
-        s.theme_use("clam")
+        # Switch to "clam" only once; the default vista/winnative theme on Windows
+        # ignores tag foreground colors, making text unreadable.
+        if s.theme_use() != "clam":
+            s.theme_use("clam")
         bg = "#2b2b2b" if dark else "#f4f6fa"
         fg = "#E8E8E8" if dark else "#1a1a1a"
         s.configure("NWV.Treeview", background=bg, foreground=fg,
@@ -103,6 +111,23 @@ class DataTable(tk.Frame):
         self.tv.tag_configure("header", background=CLR_ACCENT,
                               foreground="#ffffff",
                               font=("Segoe UI", 11, "bold"))
+
+    @classmethod
+    def refresh_all_themes(cls):
+        """Re-apply colors to all live DataTable instances after a theme change."""
+        dark = ctk.get_appearance_mode() == "Dark"
+        cls._apply_style(dark)
+        bg = "#2b2b2b" if dark else "#f4f6fa"
+        live = []
+        for inst in cls._instances:
+            try:
+                inst.configure(bg=bg)
+                inst._dark = dark
+                inst._setup_tags()
+                live.append(inst)
+            except tk.TclError:
+                pass  # widget was destroyed
+        cls._instances = live
 
     def set_columns(self, columns: list[str], widths: dict | None = None):
         widths = widths or {}
@@ -178,6 +203,9 @@ class InvoerTab(ctk.CTkFrame):
         btn_row.grid(row=3, column=0, sticky="ew", padx=10, pady=6)
         ctk.CTkButton(btn_row, text="+ Toevoegen", width=110,
                       command=self._add_deelnemer).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Bewerk boot", width=105,
+                      fg_color="transparent", border_width=1,
+                      command=self._edit_boottype).pack(side="left", padx=(0, 6))
         ctk.CTkButton(btn_row, text="Verwijder", width=100,
                       fg_color="transparent", border_width=1,
                       command=self._del_deelnemer).pack(side="left")
@@ -332,9 +360,20 @@ class InvoerTab(ctk.CTkFrame):
             return
         idx = sel[0]
         nr  = self._reeksen[idx]
+
+        # Remove the deleted race from the list and its time data
         self._reeksen.pop(idx)
         self._tijden.pop(nr, None)
-        self._rk_lb.delete(idx)
+
+        # Renumber remaining races sequentially (e.g. [1,3] → [1,2])
+        old_to_new = {old: new for new, old in enumerate(sorted(self._reeksen), start=1)}
+        self._tijden = {old_to_new[k]: v for k, v in self._tijden.items() if k in old_to_new}
+        self._reeksen = list(range(1, len(self._reeksen) + 1))
+
+        self._rk_lb.delete(0, "end")
+        for r in self._reeksen:
+            self._rk_lb.insert("end", f"  Reeks {r}")
+
         self._selected_reeks = None
         self._refresh_tijden_panel()
 
@@ -347,6 +386,7 @@ class InvoerTab(ctk.CTkFrame):
 
     def get_dataframe(self) -> pd.DataFrame:
         rows = []
+        errors = []
         for reeks in self._reeksen:
             for dl in self._deelnemers:
                 naam = dl["naam"]
@@ -357,15 +397,67 @@ class InvoerTab(ctk.CTkFrame):
                     min_s = min_v.get().strip()
                     sec_s = sec_v.get().strip()
                     if min_s or sec_s:
+                        try:
+                            min_i = int(min_s) if min_s else 0
+                            sec_i = int(sec_s) if sec_s else 0
+                        except ValueError:
+                            errors.append(
+                                f"Ongeldige tijd voor {naam} in reeks {reeks}: "
+                                f"'{min_s}:{sec_s}' (alleen cijfers toegestaan)"
+                            )
+                            continue
+                        if not (0 <= min_i <= 999 and 0 <= sec_i <= 59):
+                            errors.append(
+                                f"Tijd buiten bereik voor {naam} in reeks {reeks}: "
+                                f"{min_i}:{sec_i:02d} (sec moet 0–59 zijn)"
+                            )
+                            continue
                         rows.append({
                             "naam": naam, "boottype": boot,
                             "reeks": reeks,
-                            "minuten":  int(min_s) if min_s else 0,
-                            "seconden": int(sec_s) if sec_s else 0,
+                            "minuten":  min_i,
+                            "seconden": sec_i,
                         })
+        if errors:
+            raise ValueError("Ongeldige tijden:\n" + "\n".join(errors))
         if not rows:
             raise ValueError("Geen tijden ingevoerd. Vul minstens een reeks in.")
         return pd.DataFrame(rows)
+
+    def _edit_boottype(self):
+        sel = self._dl_tv.selection()
+        if not sel:
+            messagebox.showwarning("Geen selectie", "Selecteer eerst een deelnemer.")
+            return
+        naam = sel[0]
+        dl = next((d for d in self._deelnemers if d["naam"] == naam), None)
+        if not dl:
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Boot wijzigen — {naam}")
+        dialog.geometry("320x160")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text=f"Nieuw boottype voor {naam}:",
+                     font=ctk.CTkFont(size=13)).pack(pady=(20, 8), padx=20, anchor="w")
+
+        boot_opties = sorted(self.py_table.keys())
+        new_boot_var = tk.StringVar(value=dl["boottype"])
+        ctk.CTkOptionMenu(dialog, variable=new_boot_var,
+                          values=boot_opties, width=260).pack(padx=20)
+
+        def _confirm():
+            new_boot = new_boot_var.get()
+            dl["boottype"] = new_boot
+            py = self.py_table.get(new_boot, "?")
+            self._dl_tv.item(naam, values=(naam, new_boot, py))
+            self._refresh_tijden_panel()
+            dialog.destroy()
+
+        ctk.CTkButton(dialog, text="Opslaan", command=_confirm,
+                      width=120).pack(pady=12)
 
     def load_demo(self, demo_rows: list, py_table: dict):
         self._deelnemers.clear()
@@ -407,7 +499,6 @@ class WedstrijdApp(ctk.CTk):
         self.invoer_pad      = None
         self.detail_df       = None
         self.samenvatting_df = None
-        self._data_source    = "manual"
 
         self._build_ui()
 
@@ -436,7 +527,7 @@ class WedstrijdApp(ctk.CTk):
         self._wedstrijd_naam = ctk.CTkEntry(
             sb, placeholder_text="Naam van de wedstrijd...", height=36)
         self._wedstrijd_naam.grid(row=r, column=0, padx=16, pady=4, sticky="ew"); r += 1
-        self._wedstrijd_naam.insert(0, "Voorjaarswedstrijd 2026")
+        self._wedstrijd_naam.insert(0, DEMO_NAAM)
 
         self._sb_section(sb, "GEGEVENSBRON", r); r += 1
         self.src_var = tk.StringVar(value="manual")
@@ -566,6 +657,7 @@ class WedstrijdApp(ctk.CTk):
             "Min": 52, "Sec": 52, "Totaal sec": 90,
             "Gecorr. tijd": 110, "Rang": 55, "Punten": 65,
         }
+        has_geschrapt = "Geschrapt" in detail.columns
 
         reeksen = sorted(detail["Reeks"].unique())
         for idx, reeks in enumerate(reeksen):
@@ -586,7 +678,10 @@ class WedstrijdApp(ctk.CTk):
             medals = {1: "gold", 2: "silver", 3: "bronze"}
             for i, (_, row) in enumerate(subset.iterrows()):
                 rang = int(row.get("Rang", 99))
-                tag  = medals.get(rang, "odd" if i % 2 == 0 else "even")
+                if has_geschrapt and bool(row.get("Geschrapt", False)):
+                    tag = "geschrapt"
+                else:
+                    tag = medals.get(rang, "odd" if i % 2 == 0 else "even")
                 tbl.add_row([self._fmt(row.get(c)) for c in cols], tag=tag)
 
     def _build_tab_py(self):
@@ -608,14 +703,13 @@ class WedstrijdApp(ctk.CTk):
             bar, text="Gereed.",
             font=ctk.CTkFont(size=11), text_color="gray")
         self.lbl_status.pack(side="left", padx=16)
-        self.progress = ctk.CTkProgressBar(bar, width=150, height=8)
+        self.progress = ctk.CTkProgressBar(bar, width=150, height=8,
+                                           mode="indeterminate")
         self.progress.pack(side="right", padx=16, pady=10)
-        self.progress.set(0)
 
     def _on_src_change(self):
         if self.src_var.get() == "manual":
             self.tabs.set("Invoer")
-        self._data_source = self.src_var.get()
 
     def _pick_file(self):
         path = filedialog.askopenfilename(
@@ -626,40 +720,34 @@ class WedstrijdApp(ctk.CTk):
             self.invoer_pad = path
             self.lbl_file.configure(text=Path(path).name)
             self.src_var.set("file")
-            self._data_source = "file"
             self._status(f"Bestand: {Path(path).name}")
 
     def _use_demo(self):
-        from wedstrijd_calculator import DEMO_DATA
         self.invoer_tab.load_demo(DEMO_DATA, self.py_table)
         self.src_var.set("manual")
-        self._data_source = "manual"
         self._wedstrijd_naam.delete(0, "end")
-        self._wedstrijd_naam.insert(0, "Voorjaarswedstrijd 2026")
+        self._wedstrijd_naam.insert(0, DEMO_NAAM)
         self.tabs.set("Invoer")
         self._status("Demo-data geladen in de invoertab.")
 
     def _start_calculation(self):
         self.btn_calc.configure(state="disabled", text="Bezig...")
-        self.progress.set(0.1)
+        self.progress.start()
         self._status("Berekening gestart...")
         threading.Thread(target=self._run_pipeline, daemon=True).start()
 
     def _run_pipeline(self):
         try:
-            self.after(0, lambda: self.progress.set(0.25))
-            if self._data_source == "manual":
+            if self.src_var.get() == "manual":
                 df = self.invoer_tab.get_dataframe()
             else:
                 df = load_race_data(self.invoer_pad)
-            self.after(0, lambda: self.progress.set(0.45))
             df = calculate_elapsed_seconds(df)
             df = calculate_corrected_time_py(df, self.py_table)
             df = rank_each_race(df)
             df = calculate_points(df)
             if self.schrap_var.get():
                 df = drop_worst_result(df)
-            self.after(0, lambda: self.progress.set(0.75))
             detail, samenvatting = generate_summary_tables(
                 df, use_drop=self.schrap_var.get())
             self.detail_df       = detail
@@ -668,6 +756,7 @@ class WedstrijdApp(ctk.CTk):
         except Exception as exc:
             self.after(0, lambda e=exc: self._on_error(str(e)))
         finally:
+            self.after(0, lambda: self.progress.stop())
             self.after(0, lambda: self.btn_calc.configure(
                 state="normal", text="Bereken"))
 
@@ -675,7 +764,6 @@ class WedstrijdApp(ctk.CTk):
         return self._wedstrijd_naam.get().strip() or "Wedstrijd"
 
     def _display_results(self, detail, samenvatting):
-        self.progress.set(1.0)
         naam = self._wedstrijd_naam_get()
         self._klass_subtitle.configure(text=naam)
 
@@ -731,12 +819,13 @@ class WedstrijdApp(ctk.CTk):
     def _toggle_theme(self):
         ctk.set_appearance_mode(
             "Dark" if self.theme_sw.get() else "Light")
+        DataTable.refresh_all_themes()
 
     def _status(self, msg: str):
         self.lbl_status.configure(text=msg)
 
     def _on_error(self, msg: str):
-        self.progress.set(0)
+        self.progress.stop()
         self._status(f"Fout: {msg}")
         messagebox.showerror("Fout", msg)
 
